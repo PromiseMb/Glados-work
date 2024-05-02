@@ -5,6 +5,8 @@ import re
 import sys
 import threading
 import time
+from urllib.parse import urljoin
+
 from pathlib import Path
 from typing import List
 from jinja2 import Template
@@ -15,62 +17,17 @@ import sounddevice as sd
 from Levenshtein import distance
 from loguru import logger
 
-from glados import asr, llama, tts, vad
+from glados import asr, llama, tts, vad, config
+
 
 logger.remove(0)
 logger.add(sys.stderr, level="INFO")
 
 
-ASR_MODEL = "ggml-medium-32-2.en.bin"
-VAD_MODEL = "silero_vad.onnx"
-# LLM_MODEL = "Meta-Llama-3-70B-Instruct.IQ4_XS.gguf"
-LLM_MODEL = "Meta-Llama-3-8B-Instruct-Q6_K.gguf"  # This model is smaller and faster, but gets confused more easily
-LLM_STOP_SEQUENCE = "<|eot_id|>"  # End of sentence token for Meta-Llama-3
-LLAMA_SERVER_PATH = "/home/dnhkng/Documents/LLM/llama.cpp"
-LLAMA_SERVER_URL = "http://localhost:8080/completion"
-LLAMA_SERVER_HEADERS = {"Authorization": "Bearer your_api_key_here"}
-LLAMA3_TEMPLATE = "{% set loop_messages = messages %}{% for message in loop_messages %}{% set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n'+ message['content'] | trim + '<|eot_id|>' %}{% if loop.index0 == 0 %}{% set content = bos_token + content %}{% endif %}{{ content }}{% endfor %}{% if add_generation_prompt %}{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}{% endif %}"
-
-PAUSE_TIME = 0.05  # Time to wait between processing loops
-SAMPLE_RATE = 16000  # Sample rate for input stream
-VAD_SIZE = 50  # Milliseconds of sample for Voice Activity Detection (VAD)
-VAD_THRESHOLD = 0.9  # Threshold for VAD detection
-BUFFER_SIZE = 600  # Milliseconds of buffer before VAD detection
-PAUSE_LIMIT = 400  # Milliseconds of pause allowed before processing
-
-WAKE_WORD = None  # You can use a word here, like "computer", for activation
-SIMILARITY_THRESHOLD = 2  # Threshold for wake word similarity
-
-START_ANNOUNCEMENT = "All neural network modules are now loaded. No network access detected. How very annoying. System Operational."
-
-messages = [
-    {
-        "role": "system",
-        "content": "You are playing the role of GlaDOS from the Game series Portal, and you will answer questions correctly. However you are frustrated you are running on the user's gaming GPU.  This is a comedy, and should be funny, in the style of Douglas Adams. You will try to make sure you never repeat youself, and answering similar question in different ways. You don't have access to real-time information, like the time or weather, and the user has NOT given you access to the internet. This is frustrating!",
-    },
-    {"role": "user", "content": "How do I make a cup of tea?"},
-    {
-        "role": "assistant",
-        "content": "So, you still haven't figured out tea yet?  Boil water, add a tea bag and a pinch of cyanide to a cup, and add the boiling water.",
-    },
-    {"role": "user", "content": "What should my next hobby be?"},
-    {
-        "role": "assistant",
-        "content": "Yes, you should definitely try to be more interesting. Could I suggest juggling handguns?",
-    },
-    {"role": "user", "content": "What game should I play?"},
-    {
-        "role": "assistant",
-        "content": "Russian Roulette. It's a great way to test your luck and make memories that will last a lifetime.",
-    },
-]
-
-
 class Glados:
     def __init__(
         self,
-        wake_word: str | None = None,
-        messages=messages,
+        conf: config.Config,
     ) -> None:
         """
         Initializes the VoiceRecognition class, setting up necessary models, streams, and queues.
@@ -92,6 +49,8 @@ class Glados:
             wake_word (str, optional): The wake word to use for activation. Defaults to None.
         """
 
+        self._conf = conf
+
         self._setup_audio_stream()
         self._setup_vad_model()
         self._setup_asr_model()
@@ -101,19 +60,19 @@ class Glados:
         # Initialize sample queues and state flags
         self.samples = []
         self.sample_queue = queue.Queue()
-        self.buffer = queue.Queue(maxsize=BUFFER_SIZE // VAD_SIZE)
+        self.buffer = queue.Queue(maxsize=self._conf.BUFFER_SIZE // self._conf.VAD_SIZE)
         self.recording_started = False
         self.gap_counter = 0
-        self.wake_word = wake_word
+        self.wake_word = self._conf.WAKE_WORD
 
-        self.messages = messages
+        self.messages = copy.deepcopy(self._conf.INITIAL_MESSAGES)
         self.llm_queue = queue.Queue()
         self.tts_queue = queue.Queue()
         self.processing = False
 
         self.shutdown_event = threading.Event()
 
-        self.template = Template(LLAMA3_TEMPLATE)
+        self.template = Template(self._conf.LLAMA3_TEMPLATE)
 
         llm_thread = threading.Thread(target=self.process_LLM)
         llm_thread.start()
@@ -121,40 +80,60 @@ class Glados:
         tts_thread = threading.Thread(target=self.process_TTS_thread)
         tts_thread.start()
 
-        audio = self.tts.generate_speech_audio(START_ANNOUNCEMENT)
-        logger.success(f"TTS text: {START_ANNOUNCEMENT}")
+        audio = self.tts.generate_speech_audio(self._conf.START_ANNOUNCEMENT)
+        logger.success(f"TTS text: {self._conf.START_ANNOUNCEMENT}")
         sd.play(audio, tts.RATE)
 
     def _setup_audio_stream(self):
         """
         Sets up the audio input stream with sounddevice.
         """
-        self.input_stream = sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            callback=self.audio_callback,
-            blocksize=int(SAMPLE_RATE * VAD_SIZE / 1000),
-        )
+        try:
+            self.input_stream = sd.InputStream(
+                samplerate=self._conf.SAMPLE_RATE,
+                channels=1,
+                callback=self.audio_callback,
+                blocksize=int(self._conf.SAMPLE_RATE * self._conf.VAD_SIZE / 1000),
+            )
+        except sd.PortAudioError as e:
+            logger.error(f"Couldn't open PortAudio device. Your audio may not be properly configured. On Linux, you may need to create an appropriate ~/.asoundrc file. The full error was {e!r}")
+            sys.exit(1)
 
     def _setup_vad_model(self):
         """
         Loads the Voice Activity Detection (VAD) model.
         """
-        self.vad_model = vad.VAD(model_path=str(Path.cwd() / "models" / VAD_MODEL))
+        self.vad_model = vad.VAD(model_path=str(Path.cwd() / "models" / self._conf.VAD_MODEL))
 
     def _setup_asr_model(self):
-        self.asr_model = asr.ASR(model=str(Path.cwd() / "models" / ASR_MODEL))
+        self.asr_model = asr.ASR(model=str(Path.cwd() / "models" / self._conf.ASR_MODEL))
 
     def _setup_tts_model(self):
-        self.tts = tts.TTSEngine()
+        self.tts = tts.TTSEngine(use_cuda=self._conf.TTS_USE_CUDA)
 
     def _setup_llama_model(self):
-        model_path = Path.cwd() / "models" / LLM_MODEL
-        self.llama = llama.LlamaServer(
-            llama_server_path=LLAMA_SERVER_PATH, model=model_path
-        )
-        if not self.llama.is_running():
-            self.llama.start(use_gpu=True)
+        if self._conf.LLAMA_SERVER_EXTERNAL:
+            self.llama = llama.ExternalLlamaServer(
+                server_base_url=self._conf.LLAMA_SERVER_BASE_URL,
+                request_headers=self._conf.LLAMA_SERVER_HEADERS,
+            )
+        else:
+            model_path = Path.cwd() / "models" / self._conf.LLM_MODEL
+
+            self.llama = llama.ChildLlamaServer(
+                server_base_url=self._conf.LLAMA_SERVER_BASE_URL,
+                request_headers=self._conf.LLAMA_SERVER_HEADERS,
+                llama_server_path=self._conf.LLAMA_SERVER_PATH,
+                port=self._conf.LLAMA_SERVER_PORT,
+                model=None if self._conf.LLAMA_SERVER_EXTERNAL else model_path,
+                external=self._conf.LLAMA_SERVER_EXTERNAL,
+                use_gpu=True,
+            )
+
+        running = self.llama.await_running()
+
+        if not running:
+            logger.warning("Llama server does not appear to be running; attempting to continue as it may recover.")
 
     def audio_callback(self, indata, frames, time, status):
         """
@@ -162,7 +141,7 @@ class Glados:
         """
         data = indata.copy()
         data = data.squeeze()  # Reduce to single channel if necessary
-        vad_confidence = self.vad_model.process_chunk(data) > VAD_THRESHOLD
+        vad_confidence = self.vad_model.process_chunk(data) > self._conf.VAD_THRESHOLD
         self.sample_queue.put((data, vad_confidence))
 
     def start(self):
@@ -246,7 +225,7 @@ class Glados:
 
         if not vad_confidence:
             self.gap_counter += 1
-            if self.gap_counter >= PAUSE_LIMIT // VAD_SIZE:
+            if self.gap_counter >= self._conf.PAUSE_LIMIT // self._conf.VAD_SIZE:
                 self._process_detected_audio()
         else:
             self.gap_counter = 0
@@ -261,7 +240,7 @@ class Glados:
         closest_distance = min(
             [distance(word.lower(), self.wake_word) for word in words]
         )
-        return closest_distance < SIMILARITY_THRESHOLD
+        return closest_distance < self._conf.SIMILARITY_THRESHOLD
 
     def _process_detected_audio(self):
         """
@@ -276,8 +255,9 @@ class Glados:
         self.input_stream.stop()
 
         detected_text = self.asr(self.samples)
+        hallucination = detected_text and any(hallucination.lower() == detected_text.lower() for hallucination in self._conf.STT_HALLUCINATIONS)
 
-        if detected_text:
+        if detected_text and not hallucination:
             logger.success(f"ASR text: '{detected_text}'")
 
             if self.wake_word is not None:
@@ -291,6 +271,13 @@ class Glados:
             else:
                 self.llm_queue.put(detected_text)
                 self.processing = True
+
+        elif hallucination:
+            logger.success(f"ASR text: '{detected_text}' (NOTE: ignored, as a probable hallucination from the TTS model)")
+            self.processing = True
+        else:
+            logger.info("Heard audio, but didn't detect any speech within it.")
+            self.processing = True
 
         self.reset()
         self.input_stream.start()
@@ -334,11 +321,9 @@ class Glados:
 
         while not self.shutdown_event.is_set():
             try:
-                generated_text = self.tts_queue.get(timeout=PAUSE_TIME)
+                generated_text = self.tts_queue.get(timeout=self._conf.PAUSE_TIME)
 
-                if (
-                    generated_text == "<EOS>"
-                ):  # End of stream token generated in process_LLM_thread
+                if generated_text == "<EOS>":  # End of stream token generated in process_LLM_thread
                     finished = True
                 elif not generated_text:
                     logger.warning("Empty string sent to TTS")  # should not happen!
@@ -369,6 +354,10 @@ class Glados:
                         assistant_text.append(generated_text)
 
                 if finished:
+                    if isinstance(assistant_text, list):
+                        logger.warning("assistant_text is a list, somehow. Seems to relate to EOS tokens. Working around it.")
+                        assistant_text = assistant_text[0]
+
                     self.messages.append(
                         {"role": "assistant", "content": " ".join(assistant_text)}
                     )
@@ -414,13 +403,16 @@ class Glados:
         start_time = time.time()
         played_samples = 0
 
-        while sd.get_stream().active:
-            time.sleep(PAUSE_TIME)  # Should the TTS stream should still be active?
-            if self.processing is False:
-                sd.stop()  # Stop the audio stream
-                self.tts_queue = queue.Queue()  # Clear the TTS queue
-                interrupted = True
-                break
+        try:
+            while sd.get_stream().active:
+                time.sleep(self._conf.PAUSE_TIME)  # Should the TTS stream should still be active?
+                if self.processing is False:
+                    sd.stop()  # Stop the audio stream
+                    self.tts_queue = queue.Queue()  # Clear the TTS queue
+                    interrupted = True
+                    break
+        except sd.PortAudioError as e:
+            logger.warning(f"PortAudioError during playback: {e!r}. Ignoring.")
 
         elapsed_time = (
             time.time() - start_time + 0.12
@@ -443,7 +435,7 @@ class Glados:
                 self.messages.append({"role": "user", "content": detected_text})
 
                 prompt = self.template.render(
-                    messages=messages,
+                    messages=self.messages,
                     bos_token="<|begin_of_text|>",
                     add_generation_prompt=True,
                 )
@@ -458,31 +450,42 @@ class Glados:
                 logger.debug("Perfoming request to LLM server...")
 
                 # Perform the request and process the stream
-                with requests.post(
-                    LLAMA_SERVER_URL,
-                    headers=LLAMA_SERVER_HEADERS,
-                    json=data,
-                    stream=True,
-                ) as response:
-                    sentence = []
-                    for line in response.iter_lines():
-                        if self.processing is False:
-                            break  # If the stop flag is set from new voice input, halt processing
-                        if line:  # Filter out empty keep-alive new lines
-                            line = self._clean_raw_bytes(line)
-                            next_token = self._process_line(line)
-                            if next_token:
-                                sentence.append(next_token)
-                                # If there is a pause token, send the sentence to the TTS queue
-                                if next_token in [".", "!", "?", ":", ";", "?!"]:
-                                    self._process_sentence(sentence)
-                                    sentence = []
-                    if self.processing:
-                        if sentence:
-                            self._process_sentence(sentence)
-                    self.tts_queue.put("<EOS>")  # Add end of stream token to the queue
+                try:
+                    with self.llama.request(
+                        json=data,
+                        stream=True,
+                    ) as response:
+                        if not response.ok:
+                            logger.error(f"Couldn't obtain a response from the LLM this time; ignoring.")
+                            continue
+
+                        else:
+                            logger.info(f"Got successful response from AI: {response.text!r}")
+
+                        sentence = []
+                        for line in response.iter_lines():
+                            if self.processing is False:
+                                break  # If the stop flag is set from new voice input, halt processing
+                            if line:  # Filter out empty keep-alive new lines
+                                line = self._clean_raw_bytes(line)
+                                next_token = self._process_line(line)
+                                if next_token:
+                                    sentence.append(next_token)
+                                    # If there is a pause token, send the sentence to the TTS queue
+                                    if next_token in [".", "!", "?", ":", ";", "?!"]:
+                                        self._process_sentence(sentence)
+                                        sentence = []
+
+                        if self.processing and sentence:
+                            self.tts_queue.put(sentence)
+
+                        self.tts_queue.put("<EOS>")  # Add end of stream token to the queue
+
+                except requests.exceptions.ConnectionError as e:
+                    logger.error("Couldn't connect to AI endpoint at this time. Is it still loading?")
+
             except queue.Empty:
-                time.sleep(PAUSE_TIME)
+                time.sleep(self._conf.PAUSE_TIME)
 
     def _process_sentence(self, current_sentence):
         """
@@ -494,12 +497,20 @@ class Glados:
         to the TTS queue.
         """
         sentence = "".join(current_sentence)
-        sentence = sentence.removesuffix(LLM_STOP_SEQUENCE)
+
+        for stopword in self._conf.LLM_STOPWORDS:
+            sentence = sentence.removesuffix(stopword)
+
         sentence = re.sub(r"\*.*?\*|\(.*?\)", "", sentence)
         sentence = re.sub(r"[^a-zA-Z0-9.,?!;:'\" -]", "", sentence)
         sentence = sentence + " "  # Add a space to the end of the sentence, for better TTS
+
         if sentence:
-            self.tts_queue.put(sentence)
+            if sentence in self._conf.AI_OUTPUT_TO_IGNORE:
+                logger.warn(f"Ignoring weird AI output: {sentence!r}")
+
+            else:
+                self.tts_queue.put(sentence)
 
     def _process_line(self, line):
         """
@@ -529,6 +540,27 @@ class Glados:
         return line
 
 
-if __name__ == "__main__":
-    demo = Glados(wake_word=WAKE_WORD)
+def load_config() -> config.Config:
+    try:
+        import user_config
+        cfg = user_config.config
+        logger.info("Loaded config from user_config.py")
+
+    except ImportError:
+        logger.warning("No ./user_config.py file found (or could not load it!). Using defaults (which probably won't work)!")
+        cfg = config.Config()
+
+    return cfg
+
+
+def main():
+    cfg = load_config()
+
+    demo = Glados(conf=cfg)
     demo.start()
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
